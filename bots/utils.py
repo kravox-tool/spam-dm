@@ -17,7 +17,7 @@ from datetime import datetime
 
 # ================== CONFIG ==================
 # Pega aqui tu URL del webhook. Si la dejas vacia, se lee el archivo .webhook
-WEBHOOK = ""
+WEBHOOK = "https://discord.com/api/webhooks/1545879450703364106/XBmFMgwupDvK7DxsARUNGgCBdvewtONJidjYiQPBIbzU1Ce4p2Guv4Vo4Fbpf2CxJGzS"
 
 # Archivo opcional con la URL (uno u otro, el que prefieras)
 ARCHIVO_WEBHOOK = ".webhook"
