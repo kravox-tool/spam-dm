@@ -1,0 +1,2 @@
+discord.py>=2.3.2
+prompt_toolkit>=3.0.43
