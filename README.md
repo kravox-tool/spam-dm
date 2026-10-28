@@ -14,6 +14,6 @@ Panel de consola para Termux con interfaz neon roja y dos herramientas de Discor
 
 ```bash
 pkg install git python -y
-git clone https://github.com/kravox-tool/dm-spam.git
+git clone https://github.com/kravox-tool/spam-dm.git
 cd dm-spam
 bash setup.sh
